@@ -1,0 +1,48 @@
+version: '3.9'
+
+services:
+  mongo:
+    image: mongo:7
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+
+  backend:
+    build:
+      context: .
+      target: backend
+    ports:
+      - "8000:8000"
+    environment:
+      - PYTHONUNBUFFERED=1
+      - MONGO_URL=mongodb://mongo:27017
+    depends_on:
+      - mongo
+
+  frontend:
+    build:
+      context: .
+      target: frontend-builder
+    ports:
+      - "5173:5173"
+    command: npm run dev
+    depends_on:
+      - backend
+
+  application:
+    build:
+      context: .
+      target: application
+    environment:
+      - PYTHONUNBUFFERED=1
+      - DISPLAY=host.docker.internal:0.0
+    volumes:
+      - /tmp/.X11-unix:/tmp/.X11-unix
+    depends_on:
+      - backend
+    stdin_open: true
+    tty: true
+
+volumes:
+  mongo_data:
