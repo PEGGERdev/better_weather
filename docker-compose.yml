@@ -30,19 +30,5 @@ services:
     depends_on:
       - backend
 
-  application:
-    build:
-      context: .
-      target: application
-    environment:
-      - PYTHONUNBUFFERED=1
-      - DISPLAY=host.docker.internal:0.0
-    volumes:
-      - /tmp/.X11-unix:/tmp/.X11-unix
-    depends_on:
-      - backend
-    stdin_open: true
-    tty: true
-
 volumes:
   mongo_data:
