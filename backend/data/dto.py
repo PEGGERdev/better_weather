@@ -6,7 +6,7 @@ import re
 class Weather(BaseModel):
     """Weather reading."""
     temp: float
-    preassure: float
+    pressure: float
     light: float
     winds: float
     winddir: str = Field(min_length=1, max_length=3)

@@ -1,6 +1,5 @@
 from __future__ import annotations
 import threading, time
-from datetime import datetime
 from typing import Optional, Tuple, Callable
 from PySide6 import QtCore
 
@@ -8,6 +7,8 @@ from model.ports import WeatherSensorPort, OSSDPort, ClockPort
 from model.dto import WeatherDTO, OSSDWriteResult
 from model.db_client import DbClient
 from model.ossd_change_writer import OSSDChangeWriter
+
+from exception_handler import format_current_exception
 
 
 class AppController:
@@ -38,8 +39,11 @@ class AppController:
         self._stop = threading.Event()
         self._th: Optional[threading.Thread] = None
 
-        # Change-only Persistor
-        self._persist = OSSDChangeWriter(self._db, logger=self._v.append_log)
+        # thread-sicheres Loggen in die View
+        self._log = lambda msg: self._post(lambda m=str(msg): self._v.append_log(m))
+
+        # Change-only Persistor (Logger ist jetzt thread-sicher!)
+        self._persist = OSSDChangeWriter(self._db, logger=self._log)
 
         self._v.set_status("Bereit")
 
@@ -59,7 +63,9 @@ class AppController:
                 f"OSSD DB-Startzustand: ch0={states[0]}, ch1={states[1]}, ch2={states[2]}, ch3={states[3]}"
             )
         except Exception as e:
-            self._v.append_log(f"Warnung: OSSD-Startzustand unbekannt ({e})")
+            # Stacktrace direkt jetzt formatieren (nicht erst später im GUI-Thread!)
+            tb = format_current_exception(f"Warnung: OSSD-Startzustand unbekannt ({e})")
+            self._v.append_log(tb)
 
         self._th = threading.Thread(target=self._loop, name="worker", daemon=True)
         self._th.start()
@@ -79,7 +85,9 @@ class AppController:
             self._tick()
             self._v.append_log("Einzeltest ok.")
         except Exception as e:
-            self._post(lambda: self._v.show_error(str(e)))
+            tb = format_current_exception(f"Einzeltest fehlgeschlagen: {e}")
+            self._log(tb)
+            self._post(lambda m=str(e): self._v.show_error(m))
 
     # ---------------- loop ----------------
     def _loop(self) -> None:
@@ -87,10 +95,13 @@ class AppController:
             while not self._stop.is_set():
                 self._tick()
                 for _ in range(int(self._interval * 10)):
-                    if self._stop.is_set(): break
+                    if self._stop.is_set():
+                        break
                     time.sleep(0.1)
         except Exception as e:
-            self._post(lambda: self._v.show_error(str(e)))
+            tb = format_current_exception(f"Worker-Loop abgebrochen: {e}")
+            self._log(tb)
+            self._post(lambda m=str(e): self._v.show_error(m))
         finally:
             self._post(lambda: self._v.set_running_state(False))
 
@@ -109,7 +120,11 @@ class AppController:
                 for idx, val in enumerate(st):
                     changed = self._persist.last_sent[idx] is not None and self._persist.last_sent[idx] != val
                     if changed:
-                        self._post(lambda i=idx, ts=now: self._v.chart_add_ossd(i, ts, f"LG{1 if i<2 else 2} OSSD{1 if i%2==0 else 2}"))
+                        self._post(
+                            lambda i=idx, ts=now: self._v.chart_add_ossd(
+                                i, ts, f"LG{1 if i<2 else 2} OSSD{1 if i%2==0 else 2}"
+                            )
+                        )
 
         # 2) Wetter lesen + anzeigen + posten (best-effort)
         if self._weather:
@@ -124,7 +139,8 @@ class AppController:
                 try:
                     self._db.post_weather(dto)
                 except Exception as e:
-                    self._post(lambda: self._v.append_log(f"POST /weather fehlgeschlagen: {e}"))
+                    tb = format_current_exception(f"POST /weather fehlgeschlagen: {e}")
+                    self._log(tb)
 
     # ---------------- gui invoke ----------------
     def _post(self, fn: Callable[[], None]) -> None:

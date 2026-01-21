@@ -5,6 +5,9 @@ from datetime import datetime
 from model.dto import OSSDEntryDTO, OSSDWriteResult
 from model.db_client import DbClient
 
+from exception_handler import format_current_exception
+
+
 class OSSDChangeWriter:
     """
     Hält den zuletzt in DB gesicherten Zustand und schreibt nur bei Änderung.
@@ -31,11 +34,11 @@ class OSSDChangeWriter:
                 lg = int(x.get("lichtgitterNr", 0))
                 on = int(x.get("ossdNr", 0))
                 st = str(x.get("ossdStatus", "E")) == "O"
-                idx = (lg-1)*2 + (on-1)   # (LG1 OSSD1 -> 0) usw.
-                if idx in (0,1,2,3):
+                idx = (lg - 1) * 2 + (on - 1)   # (LG1 OSSD1 -> 0) usw.
+                if idx in (0, 1, 2, 3):
                     self.last_sent[idx] = st
         except Exception as e:
-            self._log(f"GET /ossd fehlgeschlagen: {e}")
+            self._log(format_current_exception(f"GET /ossd fehlgeschlagen: {e}"))
         return self.last_sent
 
     def persist_if_changed(self, state: Tuple[bool, bool, bool, bool], ts: datetime) -> OSSDWriteResult:
@@ -51,7 +54,7 @@ class OSSDChangeWriter:
                     self.last_sent[idx] = val
                     posted += 1
                 except Exception as e:
-                    self._log(f"POST /ossd fehlgeschlagen: {e}")
+                    self._log(format_current_exception(f"POST /ossd fehlgeschlagen: {e}"))
             else:
                 skipped += 1
         return OSSDWriteResult(posted=posted, skipped=skipped)

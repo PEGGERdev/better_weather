@@ -4,6 +4,8 @@ from typing import Optional, Tuple, Callable
 import serial
 
 from model.ports import OSSDPort, ClockPort
+from exception_handler import format_current_exception
+
 
 class SerialOSSD(OSSDPort):
     """
@@ -18,7 +20,7 @@ class SerialOSSD(OSSDPort):
 
     def _parse_line(self, line: str) -> Optional[Tuple[bool, bool, bool, bool]]:
         m = re.findall(r"G([0-3])([OE])", line)
-        if len(m) != 4: 
+        if len(m) != 4:
             return None
         vals = [None, None, None, None]
         for idx, ch in m:
@@ -41,5 +43,5 @@ class SerialOSSD(OSSDPort):
                 st = self._parse_line(line2)
             return st
         except Exception as e:
-            self._log(f"SerialOSSD Fehler: {e}")
+            self._log(format_current_exception(f"SerialOSSD Fehler: {e}"))
             return None

@@ -1,9 +1,10 @@
 from __future__ import annotations
 import requests
-from typing import Iterable, List, Tuple, Optional
-from datetime import datetime
-
+from typing import List
 from model.dto import WeatherDTO, OSSDEntryDTO
+
+from exception_handler import format_current_exception
+
 
 class DbClient:
     """Kommuniziert mit dem FastAPI-Backend (keine direkte DB)."""
@@ -18,16 +19,20 @@ class DbClient:
         try:
             self._s.post(f"{self.base}/weather/", json=w.__dict__, timeout=5)
         except Exception as e:
-            self._log(f"POST /weather fehlgeschlagen: {e}")
+            self._log(format_current_exception(f"POST /weather fehlgeschlagen: {e}"))
 
     # ----- OSSD -----
     def post_ossd(self, entry: OSSDEntryDTO) -> None:
-        self._s.post(f"{self.base}/ossd/", json={
-            "time": entry.time.isoformat(),
-            "lichtgitterNr": entry.lichtgitterNr,
-            "ossdNr": entry.ossdNr,
-            "ossdStatus": entry.ossdStatus
-        }, timeout=5)
+        self._s.post(
+            f"{self.base}/ossd/",
+            json={
+                "time": entry.time.isoformat(),
+                "lichtgitterNr": entry.lichtgitterNr,
+                "ossdNr": entry.ossdNr,
+                "ossdStatus": entry.ossdStatus
+            },
+            timeout=5
+        )
 
     def get_ossd_recent(self, limit: int = 200) -> List[dict]:
         """Holt alle und schneidet hinten ab – Router hat kein Limit/Sort."""
