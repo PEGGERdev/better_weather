@@ -67,6 +67,7 @@ def main() -> None:
     hid_vid     = _env_int("HID_VID", 0x1941)
     hid_pid     = _env_int("HID_PID", 0x8021)
     interval    = float(os.getenv("INTERVAL_SEC", "30"))
+    poll_sec    = float(os.getenv("POLL_SEC", "0.2"))
     base_url    = os.getenv("BACKEND_BASE", "http://127.0.0.1:8000")
 
     # --- MODEL-Instantiiierung ---
@@ -93,6 +94,7 @@ def main() -> None:
         ossd=ossd,
         clock=clock,
         interval_sec=interval,
+        poll_sec=poll_sec
     )
 
     # --- VIEW-Events verbinden ---
