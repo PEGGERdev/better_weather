@@ -1,7 +1,30 @@
 from __future__ import annotations
-import threading, time, json
-from typing import Optional, Tuple, Callable, List
+
+"""
+Witterungstester – AppController (Orchestrator)
+
+Role
+- Polls OSSD live (UI updates immediately).
+- Records every OSSD change (WAL immediately, backend only every flush interval).
+- Reads weather only on flush interval (UI updates on interval).
+- Redraws chart only on flush interval (performance).
+
+Threading
+- Worker thread runs polling + flush schedule.
+- All UI interactions are marshalled to the GUI thread via Qt signal.
+
+Design goals
+- SOLID: isolate responsibilities (WAL store, OSSD tracking).
+- DRY  : single mapping for channel -> (lichtgitter, ossd, label).
+- KISS : keep orchestration in one place, helper classes small and local.
+"""
+
+import threading
+import time
+import json
 from pathlib import Path
+from typing import Optional, Callable, List, Tuple, Protocol
+
 from PySide6 import QtCore
 
 from model.ports import WeatherSensorPort, OSSDPort, ClockPort
@@ -17,22 +40,185 @@ except Exception:
         return f"{msg}\n{traceback.format_exc()}"
 
 
+# ---------------- View contract (documentation / DIP) ----------------
+class AppViewPort(Protocol):
+    def set_status(self, text: str) -> None: ...
+    def set_running_state(self, running: bool) -> None: ...
+    def show_error(self, msg: str) -> None: ...
+    def append_log(self, line: str) -> None: ...
+    def update_ossd(self, st: Tuple[bool, bool, bool, bool]) -> None: ...
+    def update_weather(self, payload: dict) -> None: ...
+    def chart_add_ossd(self, channel_idx: int, ts, label: str) -> None: ...
+    def chart_redraw(self) -> None: ...
+
+
+class _GuiInvoker(QtCore.QObject):
+    """
+    Thread-safe bridge: worker thread -> GUI thread.
+
+    WHY
+    - Worker thread must never touch Qt widgets directly.
+    - A Qt signal ensures queued execution on the GUI thread.
+    """
+    invoke = QtCore.Signal(object)
+
+
+def _channel_meta(idx: int) -> Tuple[int, int, str]:
+    """
+    Maps channel index (0..3) to (lichtgitterNr, ossdNr, label).
+    """
+    lg = 1 if idx < 2 else 2
+    on = 1 if idx % 2 == 0 else 2
+    return lg, on, f"LG{lg} OSSD{on}"
+
+
+class WalJsonlStore:
+    """
+    Minimal jsonl WAL store for OSSD events.
+
+    Contract
+    - append(): best-effort, must never crash app
+    - load()  : best-effort, returns [] on failure
+    - rewrite(): best-effort, keeps only pending backlog
+    """
+
+    def __init__(self, path: Path):
+        self._path = path
+
+    def append(self, entry: OSSDEntryDTO) -> None:
+        try:
+            rec = {
+                "time": entry.time.isoformat(),
+                "lichtgitterNr": entry.lichtgitterNr,
+                "ossdNr": entry.ossdNr,
+                "ossdStatus": entry.ossdStatus,
+            }
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            with self._path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        except Exception:
+            # NOTE: WAL is a safety net; it must never break the app.
+            pass
+
+    def load(self, clock: ClockPort) -> List[OSSDEntryDTO]:
+        if not self._path.exists():
+            return []
+        try:
+            from datetime import datetime
+            out: List[OSSDEntryDTO] = []
+            with self._path.open("r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    obj = json.loads(line)
+                    ts = obj.get("time")
+                    dt = datetime.fromisoformat(ts) if isinstance(ts, str) else clock.now()
+                    out.append(
+                        OSSDEntryDTO(
+                            time=dt,
+                            lichtgitterNr=int(obj.get("lichtgitterNr", 0)),
+                            ossdNr=int(obj.get("ossdNr", 0)),
+                            ossdStatus=str(obj.get("ossdStatus", "E")),
+                        )
+                    )
+            return out
+        except Exception:
+            return []
+
+    def rewrite(self, entries: List[OSSDEntryDTO]) -> None:
+        try:
+            if not entries:
+                if self._path.exists():
+                    self._path.unlink(missing_ok=True)
+                return
+
+            tmp = self._path.with_suffix(".tmp")
+            with tmp.open("w", encoding="utf-8") as f:
+                for entry in entries:
+                    rec = {
+                        "time": entry.time.isoformat(),
+                        "lichtgitterNr": entry.lichtgitterNr,
+                        "ossdNr": entry.ossdNr,
+                        "ossdStatus": entry.ossdStatus,
+                    }
+                    f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            tmp.replace(self._path)
+        except Exception:
+            pass
+
+
+class OssdStateTracker:
+    """
+    Tracks OSSD state for:
+    - UI updates (only on change)
+    - Event generation (only on change, no event on first observation)
+
+    INVARIANT
+    - prev[idx] is last known state for change detection; None means uninitialized.
+    """
+
+    def __init__(self) -> None:
+        self.prev: List[Optional[bool]] = [None, None, None, None]
+        self.ui_last: Optional[Tuple[bool, bool, bool, bool]] = None
+
+    def seed_from_backend(self, states: List[Optional[bool]]) -> Tuple[bool, bool, bool, bool]:
+        self.prev = list(states)
+        ui_state = tuple(bool(x) if x is not None else False for x in states)  # None -> red
+        self.ui_last = ui_state
+        return ui_state  # for immediate UI update
+
+    def process(
+        self,
+        now,
+        st: Tuple[bool, bool, bool, bool],
+    ) -> Tuple[Optional[Tuple[bool, bool, bool, bool]], List[Tuple[int, object, str]], List[OSSDEntryDTO]]:
+        # UI update only if changed
+        ui_update: Optional[Tuple[bool, bool, bool, bool]] = None
+        if self.ui_last != st:
+            self.ui_last = st
+            ui_update = st
+
+        chart_events: List[Tuple[int, object, str]] = []
+        new_entries: List[OSSDEntryDTO] = []
+
+        for idx, val in enumerate(st):
+            prev = self.prev[idx]
+
+            if prev is None:
+                self.prev[idx] = val
+                continue
+
+            if prev != val:
+                lg, on, label = _channel_meta(idx)
+                chart_events.append((idx, now, label))
+                new_entries.append(
+                    OSSDEntryDTO(
+                        time=now,
+                        lichtgitterNr=lg,
+                        ossdNr=on,
+                        ossdStatus=("O" if val else "E"),
+                    )
+                )
+                self.prev[idx] = val
+
+        return ui_update, chart_events, new_entries
+
+
 class AppController:
     """
-    - OSSD/Lichtgitter: live lesen + UI sofort updaten + jede Änderung als Event festhalten
-      => Events werden sofort in WAL (jsonl) geschrieben und nur alle flush_sec ans Backend gepostet.
-    - Wetter: nur alle flush_sec messen + UI updaten + posten (dazwischen ignoriert)
+    See module docstring for behavior details.
     """
 
     def __init__(
         self,
-        view,
+        view: AppViewPort,
         model_db: DbClient,
         weather: Optional[WeatherSensorPort],
         ossd: Optional[OSSDPort],
         clock: ClockPort,
-        interval_sec: float = 30.0,      # DB Flush + Wetter Messintervall
-        poll_sec: float = 0.05,          # OSSD Polling (live)
+        interval_sec: float = 30.0,
+        poll_sec: float = 0.05,
         wal_path: str = "ossd_events_wal.jsonl",
     ) -> None:
         self._v = view
@@ -47,15 +233,16 @@ class AppController:
         self._stop = threading.Event()
         self._th: Optional[threading.Thread] = None
 
-        # Nur fürs Initial-Sync (optional)
+        # Optional initial sync helper (backend reconstruction)
         self._persist = OSSDChangeWriter(self._db, logger=self._v.append_log)
 
-        # Live-State für Change-Detection
-        self._prev_ossd: List[Optional[bool]] = [None, None, None, None]
-
-        # Event-Queue + WAL
+        self._tracker = OssdStateTracker()
         self._queue: List[OSSDEntryDTO] = []
-        self._wal = Path(wal_path)
+
+        self._wal_store = WalJsonlStore(Path(wal_path))
+
+        self._invoker = _GuiInvoker()
+        self._invoker.invoke.connect(self._invoke_safe)
 
         self._v.set_status("Bereit")
 
@@ -68,14 +255,19 @@ class AppController:
         self._stop.clear()
         self._v.set_running_state(True)
 
-        # WAL laden (damit wirklich jede Änderung "festgehalten" bleibt)
-        self._load_wal_into_queue()
+        # Load WAL into queue (so every change stays recorded)
+        loaded = self._wal_store.load(self._clock)
+        if loaded:
+            self._queue.extend(loaded)
+            self._v.append_log(f"WAL geladen: {len(loaded)} OSSD-Events pending.")
 
-        # Startzustände aus DB rekonstruieren (best-effort)
+        # Reconstruct start state from backend (best-effort)
         try:
             states = self._persist.sync_from_backend()
             if isinstance(states, list) and len(states) == 4:
-                self._prev_ossd = list(states)
+                ui_state = self._tracker.seed_from_backend(states)
+                self._post(lambda s=ui_state: self._v.update_ossd(s))
+
             self._v.append_log(
                 f"OSSD DB-Startzustand: ch0={states[0]}, ch1={states[1]}, ch2={states[2]}, ch3={states[3]}"
             )
@@ -84,8 +276,9 @@ class AppController:
 
         self._th = threading.Thread(target=self._loop, name="worker", daemon=True)
         self._th.start()
+
         self._v.append_log(
-            f"Live OSSD Polling {self._poll:.2f}s | Wetter+DB Flush alle {self._flush_sec:.0f}s | WAL={self._wal}"
+            f"Live OSSD Polling {self._poll:.2f}s | Wetter+DB Flush alle {self._flush_sec:.0f}s | WAL={self._wal_store._path}"
         )
 
     def stop(self) -> None:
@@ -97,8 +290,8 @@ class AppController:
         self._v.set_running_state(False)
         self._v.append_log("Gestoppt.")
 
-        # Wichtig: KEIN extra DB-Write beim Stop (damit 'nur alle 30s' wirklich gilt)
-        # OSSD-Events sind durch WAL trotzdem "festgehalten" und werden beim nächsten Start/Flush gesendet.
+        # NOTE: No extra DB write on stop (keep "only every 30s" true).
+        # WAL keeps all events and will be flushed on next start/flush.
 
     def test_once(self) -> None:
         try:
@@ -113,10 +306,8 @@ class AppController:
         next_flush = time.monotonic() + self._flush_sec
         try:
             while not self._stop.is_set():
-                # OSSD live
                 self._tick_ossd_live()
 
-                # Flush: Wetter messen + DB schreiben (gebündelt)
                 now_m = time.monotonic()
                 if now_m >= next_flush:
                     self._flush()
@@ -137,46 +328,24 @@ class AppController:
 
         now = self._clock.now()
         st = self._ossd.read_state()
-        if not st:
+        if st is None:
             return
 
-        # UI sofort aktualisieren
-        self._post(lambda s=st: self._v.update_ossd(s))
+        ui_update, chart_events, new_entries = self._tracker.process(now, st)
 
-        # Jede Änderung als Event festhalten (nicht nur finalen Stand)
-        for idx, val in enumerate(st):
-            prev = self._prev_ossd[idx]
+        if ui_update is not None:
+            self._post(lambda s=ui_update: self._v.update_ossd(s))
 
-            # Initialisierung: noch kein Event
-            if prev is None:
-                self._prev_ossd[idx] = val
-                continue
+        for idx, ts, label in chart_events:
+            self._post(lambda i=idx, t=ts, l=label: self._v.chart_add_ossd(i, t, l))
 
-            if prev != val:
-                # Diagramm-Event sofort
-                self._post(
-                    lambda i=idx, ts=now: self._v.chart_add_ossd(
-                        i, ts, f"LG{1 if i<2 else 2} OSSD{1 if i%2==0 else 2}"
-                    )
-                )
+        for entry in new_entries:
+            self._queue.append(entry)
+            self._wal_store.append(entry)
 
-                # Queue + WAL (sofort!)
-                lg = 1 if idx < 2 else 2
-                on = 1 if idx % 2 == 0 else 2
-                entry = OSSDEntryDTO(
-                    time=now,
-                    lichtgitterNr=lg,
-                    ossdNr=on,
-                    ossdStatus=("O" if val else "E"),
-                )
-                self._queue.append(entry)
-                self._append_wal(entry)
-
-                self._prev_ossd[idx] = val
-
-    # ---------------- flush (alle 30s) ----------------
+    # ---------------- flush (every interval) ----------------
     def _flush(self) -> None:
-        # 1) Wetter nur im Intervall messen + posten (dazwischen ignoriert)
+        # 1) Weather only on interval
         if self._weather:
             try:
                 now = self._clock.now()
@@ -188,107 +357,62 @@ class AppController:
                         humidity=w.humidity, time=getattr(w, "time", now)
                     )
                     self._post(lambda d=dto: self._v.update_weather(d.__dict__))
-                    self._db.post_weather(dto)  # best-effort (DbClient loggt bei Exception)
+                    self._db.post_weather(dto)
             except Exception as e:
                 self._post(lambda: self._v.append_log(format_current_exception(f"Flush Weather fehlgeschlagen: {e}")))
 
-        # 2) OSSD-Events gebündelt ans Backend (jede Änderung)
+        # 2) OSSD events batched to backend
         if not self._queue:
             self._post(lambda: self._v.append_log("DB-Flush: ossd queued=0"))
-            return
+        else:
+            to_send = self._queue
+            self._queue = []
 
-        to_send = self._queue
-        self._queue = []
+            ok = 0
+            fail = 0
+            remaining: List[OSSDEntryDTO] = []
 
-        ok = 0
-        fail = 0
-        remaining: List[OSSDEntryDTO] = []
+            for entry in to_send:
+                try:
+                    self._db.post_ossd(entry)
+                    ok += 1
+                except Exception as e:
+                    fail += 1
+                    remaining.append(entry)
+                    self._post(lambda: self._v.append_log(format_current_exception(f"Flush OSSD fehlgeschlagen: {e}")))
 
-        for entry in to_send:
+            self._queue = remaining + self._queue
+            self._wal_store.rewrite(self._queue)
+
+            self._post(lambda: self._v.append_log(
+                f"DB-Flush: ossd ok={ok} fail={fail} remaining={len(self._queue)}"
+            ))
+
+        # 3) Chart redraw only on interval
+        if hasattr(self._v, "chart_redraw"):
+            self._post(self._v.chart_redraw)
+
+    # ---------------- GUI invoke ----------------
+    @QtCore.Slot(object)
+    def _invoke_safe(self, fn_obj: object) -> None:
+        try:
+            if callable(fn_obj):
+                fn_obj()
+        except Exception:
+            # NOTE: Logging must never kill the UI thread.
             try:
-                self._db.post_ossd(entry)
-                ok += 1
-            except Exception as e:
-                fail += 1
-                remaining.append(entry)
-                self._post(lambda: self._v.append_log(format_current_exception(f"Flush OSSD fehlgeschlagen: {e}")))
+                self._v.append_log(format_current_exception("GUI invoke fehlgeschlagen"))
+            except Exception:
+                pass
 
-        # Backlog behalten
-        self._queue = remaining + self._queue
-
-        # WAL auf den aktuellen Backlog reduzieren (damit nichts verloren geht)
-        self._rewrite_wal(self._queue)
-
-        self._post(lambda: self._v.append_log(
-            f"DB-Flush: ossd ok={ok} fail={fail} remaining={len(self._queue)}"
-        ))
-
-    # ---------------- WAL helpers ----------------
-    def _append_wal(self, entry: OSSDEntryDTO) -> None:
-        try:
-            rec = {
-                "time": entry.time.isoformat(),
-                "lichtgitterNr": entry.lichtgitterNr,
-                "ossdNr": entry.ossdNr,
-                "ossdStatus": entry.ossdStatus,
-            }
-            self._wal.parent.mkdir(parents=True, exist_ok=True)
-            with self._wal.open("a", encoding="utf-8") as f:
-                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-        except Exception:
-            # WAL ist nur zusätzlicher Schutz; darf nie die App brechen
-            pass
-
-    def _load_wal_into_queue(self) -> None:
-        if not self._wal.exists():
-            return
-        try:
-            from datetime import datetime
-            loaded = 0
-            with self._wal.open("r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    obj = json.loads(line)
-                    ts = obj.get("time")
-                    dt = datetime.fromisoformat(ts) if isinstance(ts, str) else self._clock.now()
-                    self._queue.append(
-                        OSSDEntryDTO(
-                            time=dt,
-                            lichtgitterNr=int(obj.get("lichtgitterNr", 0)),
-                            ossdNr=int(obj.get("ossdNr", 0)),
-                            ossdStatus=str(obj.get("ossdStatus", "E")),
-                        )
-                    )
-                    loaded += 1
-            if loaded:
-                self._v.append_log(f"WAL geladen: {loaded} OSSD-Events pending.")
-        except Exception as e:
-            self._v.append_log(format_current_exception(f"WAL laden fehlgeschlagen: {e}"))
-
-    def _rewrite_wal(self, entries: List[OSSDEntryDTO]) -> None:
-        try:
-            if not entries:
-                # optional: leere Datei entfernen
-                if self._wal.exists():
-                    self._wal.unlink(missing_ok=True)  # py>=3.8
-                return
-
-            tmp = self._wal.with_suffix(".tmp")
-            with tmp.open("w", encoding="utf-8") as f:
-                for entry in entries:
-                    rec = {
-                        "time": entry.time.isoformat(),
-                        "lichtgitterNr": entry.lichtgitterNr,
-                        "ossdNr": entry.ossdNr,
-                        "ossdStatus": entry.ossdStatus,
-                    }
-                    f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-            tmp.replace(self._wal)
-        except Exception:
-            pass
-
-    # ---------------- gui invoke ----------------
     def _post(self, fn: Callable[[], None]) -> None:
-        QtCore.QTimer.singleShot(0, fn)
+        """
+        Thread-safe GUI dispatch.
+        """
+        try:
+            self._invoker.invoke.emit(fn)
+        except Exception:
+            try:
+                QtCore.QTimer.singleShot(0, fn)
+            except Exception:
+                pass

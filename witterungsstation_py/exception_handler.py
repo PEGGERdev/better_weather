@@ -1,4 +1,16 @@
+# exception_handler.py
 from __future__ import annotations
+
+"""
+Witterungstester – Exception/Traceback Utilities
+
+Role
+- Provides a consistent exception/traceback formatting + safe logging.
+- Installs global hooks (sys + threading) to capture full tracebacks.
+
+Error handling
+- Logging must never raise further exceptions (safe_log).
+"""
 
 from typing import Callable, Optional
 import datetime
@@ -15,8 +27,8 @@ def _ts() -> str:
 
 def format_current_exception(context: str) -> str:
     """
-    Muss innerhalb eines `except:` Blocks aufgerufen werden.
-    Gibt Kontext + Stacktrace zurück.
+    Must be called inside an `except:` block.
+    Returns context + stacktrace.
     """
     tb = traceback.format_exc().rstrip()
     return f"[{_ts()}] {context}\n{tb}"
@@ -24,7 +36,7 @@ def format_current_exception(context: str) -> str:
 
 def format_exception(context: str, exc_type, exc, tb) -> str:
     """
-    Für sys/thread excepthooks (wo exc_type/exc/tb separat vorliegen).
+    For sys/thread excepthooks where exc_type/exc/tb are provided separately.
     """
     tb_txt = "".join(traceback.format_exception(exc_type, exc, tb)).rstrip()
     return f"[{_ts()}] {context}: {exc}\n{tb_txt}"
@@ -32,8 +44,8 @@ def format_exception(context: str, exc_type, exc, tb) -> str:
 
 def safe_log(log: Optional[LogFn], text: str) -> None:
     """
-    Loggt in GUI-Konsole (falls log gesetzt) oder fallback nach stderr.
-    Darf niemals Exceptions nach außen werfen.
+    Logs to GUI console (if log is provided) or falls back to stderr.
+    Must never raise exceptions outward.
     """
     if log is None:
         try:
@@ -56,8 +68,8 @@ def install_global_exception_hooks(
     post: Optional[PostFn] = None,
 ) -> None:
     """
-    Sorgt dafür, dass unhandled Exceptions (Main + Threads) als Stacktrace geloggt werden.
-    post: wenn gesetzt, wird das Logging thread-sicher in den GUI-Thread gepostet.
+    Ensures unhandled exceptions (main + threads) are logged with a full traceback.
+    post: if provided, logging is dispatched thread-safely to the GUI thread.
     """
 
     def emit(text: str) -> None:
@@ -77,7 +89,6 @@ def install_global_exception_hooks(
     # Threads (Py>=3.8)
     try:
         import threading
-
         if hasattr(threading, "excepthook"):
             def _thread_hook(args) -> None:
                 emit(
