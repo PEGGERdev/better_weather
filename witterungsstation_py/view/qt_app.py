@@ -1,343 +1,281 @@
+# view/qt_app.py
 from __future__ import annotations
-import threading, time, json
-from typing import Optional, Callable, List, Tuple
-from pathlib import Path
-from PySide6 import QtCore
 
-from model.ports import WeatherSensorPort, OSSDPort, ClockPort
-from model.dto import WeatherDTO, OSSDEntryDTO
-from model.db_client import DbClient
-from model.ossd_change_writer import OSSDChangeWriter
+"""
+Witterungstester – Qt View (PySide6)
 
-try:
-    from exception_handler import format_current_exception
-except Exception:
-    def format_current_exception(msg: str) -> str:
-        import traceback
-        return f"{msg}\n{traceback.format_exc()}"
+Role
+- UI: LEDs for OSSD, labels/table for current weather, chart for trends/events.
+
+Interfaces (used by controller)
+- update_ossd(state)
+- update_weather(payload)
+- chart_add_ossd(...)
+- chart_redraw()
+- append_log(...)
+
+Threading
+- Must be executed on the GUI thread only.
+"""
+
+from typing import Any, Tuple
+from datetime import datetime
+
+from PySide6 import QtCore, QtGui, QtWidgets
+from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.figure import Figure
 
 
-class _GuiInvoker(QtCore.QObject):
-    """
-    Thread-sichere Brücke: Worker-Thread -> GUI-Thread.
-    """
-    invoke = QtCore.Signal(object)
+# ---------------- Dark theme ----------------
+def apply_dark_palette(app: QtWidgets.QApplication) -> None:
+    palette = QtGui.QPalette()
+    c_bg = QtGui.QColor(37, 37, 39)
+    c_mid = QtGui.QColor(53, 53, 55)
+    c_fg = QtGui.QColor(220, 220, 220)
+    c_acc = QtGui.QColor(42, 130, 218)
+
+    palette.setColor(QtGui.QPalette.Window, c_bg)
+    palette.setColor(QtGui.QPalette.WindowText, c_fg)
+    palette.setColor(QtGui.QPalette.Base, QtGui.QColor(30, 30, 30))
+    palette.setColor(QtGui.QPalette.AlternateBase, c_mid)
+    palette.setColor(QtGui.QPalette.ToolTipBase, c_fg)
+    palette.setColor(QtGui.QPalette.ToolTipText, c_fg)
+    palette.setColor(QtGui.QPalette.Text, c_fg)
+    palette.setColor(QtGui.QPalette.Button, c_mid)
+    palette.setColor(QtGui.QPalette.ButtonText, c_fg)
+    palette.setColor(QtGui.QPalette.Highlight, c_acc)
+    palette.setColor(QtGui.QPalette.HighlightedText, QtGui.QColor(0, 0, 0))
+    app.setPalette(palette)
+    app.setStyle("Fusion")
 
 
-class AppController:
-    """
-    - OSSD/Lichtgitter: live lesen + UI sofort updaten + jede Änderung als Event festhalten
-      => Events werden sofort in WAL (jsonl) geschrieben und nur alle flush_sec ans Backend gepostet.
-    - Wetter: nur alle flush_sec messen + UI updaten + posten (dazwischen ignoriert)
-    - Diagramm: nur alle flush_sec redraw (Performance)
-    """
+# ---------------- small LED widget ----------------
+class Led(QtWidgets.QFrame):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(28, 20)
+        self._set(False)
 
-    def __init__(
-        self,
-        view,
-        model_db: DbClient,
-        weather: Optional[WeatherSensorPort],
-        ossd: Optional[OSSDPort],
-        clock: ClockPort,
-        interval_sec: float = 30.0,      # DB Flush + Wetter Messintervall
-        poll_sec: float = 0.05,          # OSSD Polling (live)
-        wal_path: str = "ossd_events_wal.jsonl",
-    ) -> None:
-        self._v = view
-        self._db = model_db
-        self._weather = weather
-        self._ossd = ossd
-        self._clock = clock
+    def _set(self, on: bool):
+        # NOTE: KISS – only two states: OK(green) / Error(red)
+        col = "#7a3a3a" if not on else "#2e7d32"
+        self.setStyleSheet(f"QFrame {{ background: {col}; border-radius: 6px; border: 1px solid #444; }}")
 
-        self._flush_sec = float(interval_sec)
-        self._poll = max(0.02, float(poll_sec))
 
-        self._stop = threading.Event()
-        self._th: Optional[threading.Thread] = None
+class MainWindow(QtWidgets.QMainWindow):
+    startClicked = QtCore.Signal()
+    stopClicked = QtCore.Signal()
+    testOnceClicked = QtCore.Signal()
 
-        # Nur fürs Initial-Sync (optional)
-        self._persist = OSSDChangeWriter(self._db, logger=self._v.append_log)
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Witterungstester – Python")
+        self.resize(1000, 640)
 
-        # Live-State für Change-Detection (DB/Events)
-        self._prev_ossd: List[Optional[bool]] = [None, None, None, None]
+        # ---------------- toolbar ----------------
+        tb = self.addToolBar("main")
+        tb.setMovable(False)
+        act_start = tb.addAction("Start")
+        act_stop = tb.addAction("Stop")
+        act_test1 = tb.addAction("Test 1×")
+        act_start.triggered.connect(self.startClicked.emit)
+        act_stop.triggered.connect(self.stopClicked.emit)
+        act_test1.triggered.connect(self.testOnceClicked.emit)
 
-        # UI-State (damit wir nicht sinnlos oft LEDs setzen)
-        self._ui_last_ossd: Optional[Tuple[bool, bool, bool, bool]] = None
+        # ---------------- header LEDs ----------------
+        header = QtWidgets.QGroupBox("OSSD Status (Gesamt)")
+        grid = QtWidgets.QGridLayout(header)
+        self._leds = [Led(), Led(), Led(), Led()]
+        labels = ["LG1 OSSD1", "LG1 OSSD2", "LG2 OSSD1", "LG2 OSSD2"]
+        for i, (txt, led) in enumerate(zip(labels, self._leds)):
+            v = QtWidgets.QVBoxLayout()
+            v.addWidget(QtWidgets.QLabel(txt), alignment=QtCore.Qt.AlignHCenter)
+            v.addWidget(led, alignment=QtCore.Qt.AlignHCenter)
+            grid.addLayout(v, 0, i)
 
-        # Event-Queue + WAL
-        self._queue: List[OSSDEntryDTO] = []
-        self._wal = Path(wal_path)
+        # ---------------- tabs ----------------
+        tabs = QtWidgets.QTabWidget()
 
-        # Thread-sicheres Posting in GUI
-        self._invoker = _GuiInvoker()
-        self._invoker.invoke.connect(self._invoke_safe)
+        # Overview
+        self._tab_over = QtWidgets.QWidget()
+        lo = QtWidgets.QGridLayout(self._tab_over)
 
-        self._v.set_status("Bereit")
+        self.lbl_temp_hw = QtWidgets.QLabel("…")
+        self.lbl_press_hw = QtWidgets.QLabel("…")
+        self.lbl_light_hw = QtWidgets.QLabel("…")
+        self.lbl_winds_hw = QtWidgets.QLabel("…")
+        self.lbl_winddir_hw = QtWidgets.QLabel("…")
+        self.lbl_rain_hw = QtWidgets.QLabel("…")
+        self.lbl_humi_hw = QtWidgets.QLabel("…")
 
-    # ---------------- lifecycle ----------------
-    def start(self) -> None:
-        if self._th and self._th.is_alive():
-            self._v.append_log("Start ignoriert: läuft bereits.")
-            return
+        left = QtWidgets.QGroupBox("Direkt (Hardware)")
+        gl = QtWidgets.QFormLayout(left)
+        gl.addRow("Temp:", self.lbl_temp_hw)
+        gl.addRow("Luftdruck:", self.lbl_press_hw)
+        gl.addRow("Lichteinstrahlung:", self.lbl_light_hw)
+        gl.addRow("Windgeschw.:", self.lbl_winds_hw)
+        gl.addRow("Windrichtung:", self.lbl_winddir_hw)
+        gl.addRow("Regen:", self.lbl_rain_hw)
+        gl.addRow("Luftfeuchte:", self.lbl_humi_hw)
 
-        self._stop.clear()
-        self._v.set_running_state(True)
+        right = QtWidgets.QGroupBox("Von Datenbank")
+        self._right_dummy = QtWidgets.QLabel("…")
+        fr = QtWidgets.QVBoxLayout(right)
+        fr.addWidget(self._right_dummy)
 
-        # WAL laden (damit wirklich jede Änderung "festgehalten" bleibt)
-        self._load_wal_into_queue()
+        lo.addWidget(left, 0, 0)
+        lo.addWidget(right, 0, 1)
 
-        # Startzustände aus DB rekonstruieren (best-effort)
-        try:
-            states = self._persist.sync_from_backend()
-            if isinstance(states, list) and len(states) == 4:
-                self._prev_ossd = list(states)
+        tabs.addTab(self._tab_over, "Übersicht")
 
-                # UI bekommt sofort einen sinnvollen Startwert (ohne Hardware-IO im GUI-Thread)
-                ui_state = tuple(bool(x) if x is not None else False for x in states)  # None -> rot
-                self._ui_last_ossd = ui_state
-                self._post(lambda s=ui_state: self._v.update_ossd(s))
+        # Console
+        self._txt_console = QtWidgets.QPlainTextEdit()
+        self._txt_console.setReadOnly(True)
+        tabs.addTab(self._txt_console, "Konsole")
 
-            self._v.append_log(
-                f"OSSD DB-Startzustand: ch0={states[0]}, ch1={states[1]}, ch2={states[2]}, ch3={states[3]}"
-            )
-        except Exception as e:
-            self._v.append_log(format_current_exception(f"Warnung: OSSD-Startzustand unbekannt ({e})"))
+        # Chart (matplotlib)
+        fig = Figure(figsize=(5, 3), constrained_layout=True)
+        self._ax_w = fig.add_subplot(111)
+        self._canvas = FigureCanvas(fig)
 
-        self._th = threading.Thread(target=self._loop, name="worker", daemon=True)
-        self._th.start()
+        self._scatter = None
+        self._hover_ann = None
+        self._setup_chart_artists()
+        self._canvas.mpl_connect("motion_notify_event", self._on_hover)
 
-        self._v.append_log(
-            f"Live OSSD Polling {self._poll:.2f}s | Wetter+DB Flush alle {self._flush_sec:.0f}s | WAL={self._wal}"
+        tabs.addTab(self._canvas, "Diagramm")
+
+        # ---------------- central layout ----------------
+        central = QtWidgets.QWidget()
+        lay = QtWidgets.QVBoxLayout(central)
+        lay.addWidget(header)
+        lay.addWidget(tabs)
+        self.setCentralWidget(central)
+
+        # Statusbar
+        self.statusBar().showMessage("Bereit")
+
+        # ---------------- chart data buffers ----------------
+        # NOTE: Chart is redrawn only on interval (performance), so we buffer data here.
+        self._x_temp: list[datetime] = []
+        self._y_temp: list[float] = []
+        self._ossd_x: list[datetime] = []
+        self._ossd_y: list[float] = []
+        self._ossd_label: list[str] = []
+
+    # ---------------- chart helpers ----------------
+    def _setup_chart_artists(self) -> None:
+        self._ax_w.set_title("Wetter & OSSD")
+        self._ax_w.set_xlabel("Zeit")
+        self._ax_w.set_ylabel("Temp [°C]")
+        self._ax_w.grid(True, alpha=0.25)
+
+        self._scatter = self._ax_w.scatter([], [], marker="x", s=70, linewidths=1.8)
+        self._hover_ann = self._ax_w.annotate(
+            "", xy=(0, 0), xytext=(15, 15),
+            textcoords="offset points",
+            bbox=dict(boxstyle="round", fc="w", ec="0.5", alpha=0.9),
+            arrowprops=dict(arrowstyle="->"),
         )
+        self._hover_ann.set_visible(False)
 
-    def stop(self) -> None:
-        self._stop.set()
-        t = self._th
-        if t and t.is_alive():
-            t.join(timeout=2.0)
-        self._th = None
-        self._v.set_running_state(False)
-        self._v.append_log("Gestoppt.")
+    # ---------------- public API (used by controller) ----------------
+    @QtCore.Slot()
+    def set_running_state(self, running: bool) -> None:
+        self.statusBar().showMessage("Läuft…" if running else "Bereit")
 
-        # Wichtig: KEIN extra DB-Write beim Stop (damit 'nur alle 30s' wirklich gilt)
-        # OSSD-Events sind durch WAL trotzdem "festgehalten" und werden beim nächsten Start/Flush gesendet.
+    @QtCore.Slot()
+    def set_status(self, text: str) -> None:
+        self.statusBar().showMessage(text)
 
-    def test_once(self) -> None:
-        try:
-            self._tick_ossd_live()
-            self._v.append_log("Einzeltest ok.")
-        except Exception as e:
-            self._post(lambda: self._v.show_error(str(e)))
-            self._v.append_log(format_current_exception(f"Einzeltest fehlgeschlagen: {e}"))
+    @QtCore.Slot()
+    def show_error(self, msg: str) -> None:
+        self.append_log(f"Fehler: {msg}")
 
-    # ---------------- main loop ----------------
-    def _loop(self) -> None:
-        next_flush = time.monotonic() + self._flush_sec
-        try:
-            while not self._stop.is_set():
-                # OSSD live
-                self._tick_ossd_live()
+    @QtCore.Slot()
+    def append_log(self, line: str) -> None:
+        self._txt_console.appendPlainText(str(line))
 
-                # Flush: Wetter messen + DB schreiben (gebündelt) + Chart redraw (Performance)
-                now_m = time.monotonic()
-                if now_m >= next_flush:
-                    self._flush()
-                    next_flush = now_m + self._flush_sec
+    # Backwards-compatible alias
+    append_console = append_log
 
-                time.sleep(self._poll)
+    @QtCore.Slot()
+    def update_weather(self, payload: dict) -> None:
+        """
+        Updates the "table/labels" (always current).
+        Chart data is only buffered here (no redraw).
+        """
+        def _fmt(v, unit=""):
+            return "…" if v is None else f"{v}{unit}"
 
-        except Exception as e:
-            self._post(lambda: self._v.show_error(str(e)))
-            self._v.append_log(format_current_exception(f"Worker-Loop abgebrochen: {e}"))
-        finally:
-            self._post(lambda: self._v.set_running_state(False))
+        self.lbl_temp_hw.setText(_fmt(payload.get("temp"), " °C"))
+        self.lbl_press_hw.setText(_fmt(payload.get("preassure"), " hPa"))
+        self.lbl_light_hw.setText(_fmt(payload.get("light")))
+        self.lbl_winds_hw.setText(_fmt(payload.get("winds"), " m/s"))
+        self.lbl_winddir_hw.setText(payload.get("winddir") or "…")
+        self.lbl_rain_hw.setText(_fmt(payload.get("rain"), " mm"))
+        self.lbl_humi_hw.setText(_fmt(payload.get("humidity"), " %"))
 
-    # ---------------- OSSD live tick ----------------
-    def _tick_ossd_live(self) -> None:
-        if not self._ossd:
+        # Buffer chart data only
+        t: datetime = payload.get("time")
+        temp = payload.get("temp")
+        if t and temp is not None:
+            self._x_temp.append(t)
+            self._y_temp.append(temp)
+
+    @QtCore.Slot()
+    def update_ossd(self, st: Tuple[bool, bool, bool, bool]) -> None:
+        """Updates LEDs live."""
+        for i, val in enumerate(st):
+            self._leds[i]._set(bool(val))
+
+    @QtCore.Slot()
+    def chart_add_ossd(self, channel_idx: int, ts: datetime, label: str) -> None:
+        """
+        Buffers OSSD events for the chart.
+        Redraw happens only on interval via chart_redraw().
+        """
+        base = {0: 0.2, 1: 0.4, 2: 0.6, 3: 0.8}[channel_idx]
+        self._ossd_x.append(ts)
+        self._ossd_y.append(base)
+        self._ossd_label.append(label)
+
+    @QtCore.Slot()
+    def chart_redraw(self) -> None:
+        """
+        Redraws chart from buffers.
+        Called by controller only on interval (performance).
+        """
+        self._ax_w.clear()
+        self._setup_chart_artists()
+
+        if self._x_temp and self._y_temp:
+            self._ax_w.plot(self._x_temp, self._y_temp, linewidth=1.0)
+
+        if self._ossd_x and self._ossd_y:
+            self._scatter.remove()
+            self._scatter = self._ax_w.scatter(self._ossd_x, self._ossd_y, marker="x", s=70, linewidths=1.8)
+
+        self._canvas.draw_idle()
+
+    # ---------------- matplotlib hover ----------------
+    def _on_hover(self, event):
+        if not self._hover_ann or not self._scatter:
             return
 
-        now = self._clock.now()
-        st = self._ossd.read_state()
-        if st is None:
-            return
-
-        # UI nur wenn sich wirklich was geändert hat (KISS + weniger UI-Last)
-        if self._ui_last_ossd != st:
-            self._ui_last_ossd = st
-            self._post(lambda s=st: self._v.update_ossd(s))
-
-        # Jede Änderung als Event festhalten (nicht nur finalen Stand)
-        for idx, val in enumerate(st):
-            prev = self._prev_ossd[idx]
-
-            # Initialisierung: noch kein Event
-            if prev is None:
-                self._prev_ossd[idx] = val
-                continue
-
-            if prev != val:
-                # Diagramm: nur buffer (View zeichnet erst beim Intervall-Redraw)
-                self._post(
-                    lambda i=idx, ts=now: self._v.chart_add_ossd(
-                        i, ts, f"LG{1 if i<2 else 2} OSSD{1 if i%2==0 else 2}"
-                    )
-                )
-
-                # Queue + WAL (sofort!)
-                lg = 1 if idx < 2 else 2
-                on = 1 if idx % 2 == 0 else 2
-                entry = OSSDEntryDTO(
-                    time=now,
-                    lichtgitterNr=lg,
-                    ossdNr=on,
-                    ossdStatus=("O" if val else "E"),
-                )
-                self._queue.append(entry)
-                self._append_wal(entry)
-
-                self._prev_ossd[idx] = val
-
-    # ---------------- flush (alle 30s) ----------------
-    def _flush(self) -> None:
-        # 1) Wetter nur im Intervall messen + UI updaten + posten (dazwischen ignoriert)
-        if self._weather:
-            try:
-                now = self._clock.now()
-                w = self._weather.read_weather()
-                if w:
-                    dto = WeatherDTO(
-                        temp=w.temp, preassure=w.preassure, light=w.light,
-                        winds=w.winds, winddir=w.winddir, rain=w.rain,
-                        humidity=w.humidity, time=getattr(w, "time", now)
-                    )
-                    # UI: Tabelle/Labels aktualisieren (Diagramm erst beim chart_redraw)
-                    self._post(lambda d=dto: self._v.update_weather(d.__dict__))
-                    self._db.post_weather(dto)  # best-effort (DbClient loggt bei Exception)
-            except Exception as e:
-                self._post(lambda: self._v.append_log(format_current_exception(f"Flush Weather fehlgeschlagen: {e}")))
-
-        # 2) OSSD-Events gebündelt ans Backend (jede Änderung)
-        if not self._queue:
-            self._post(lambda: self._v.append_log("DB-Flush: ossd queued=0"))
-        else:
-            to_send = self._queue
-            self._queue = []
-
-            ok = 0
-            fail = 0
-            remaining: List[OSSDEntryDTO] = []
-
-            for entry in to_send:
-                try:
-                    self._db.post_ossd(entry)
-                    ok += 1
-                except Exception as e:
-                    fail += 1
-                    remaining.append(entry)
-                    self._post(lambda: self._v.append_log(format_current_exception(f"Flush OSSD fehlgeschlagen: {e}")))
-
-            # Backlog behalten
-            self._queue = remaining + self._queue
-
-            # WAL auf den aktuellen Backlog reduzieren (damit nichts verloren geht)
-            self._rewrite_wal(self._queue)
-
-            self._post(lambda: self._v.append_log(
-                f"DB-Flush: ossd ok={ok} fail={fail} remaining={len(self._queue)}"
-            ))
-
-        # 3) Diagramm nur pro Intervall redrawen (Performance)
-        if hasattr(self._v, "chart_redraw"):
-            self._post(self._v.chart_redraw)
-
-    # ---------------- WAL helpers ----------------
-    def _append_wal(self, entry: OSSDEntryDTO) -> None:
-        try:
-            rec = {
-                "time": entry.time.isoformat(),
-                "lichtgitterNr": entry.lichtgitterNr,
-                "ossdNr": entry.ossdNr,
-                "ossdStatus": entry.ossdStatus,
-            }
-            self._wal.parent.mkdir(parents=True, exist_ok=True)
-            with self._wal.open("a", encoding="utf-8") as f:
-                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-        except Exception:
-            # WAL ist nur zusätzlicher Schutz; darf nie die App brechen
-            pass
-
-    def _load_wal_into_queue(self) -> None:
-        if not self._wal.exists():
-            return
-        try:
-            from datetime import datetime
-            loaded = 0
-            with self._wal.open("r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    obj = json.loads(line)
-                    ts = obj.get("time")
-                    dt = datetime.fromisoformat(ts) if isinstance(ts, str) else self._clock.now()
-                    self._queue.append(
-                        OSSDEntryDTO(
-                            time=dt,
-                            lichtgitterNr=int(obj.get("lichtgitterNr", 0)),
-                            ossdNr=int(obj.get("ossdNr", 0)),
-                            ossdStatus=str(obj.get("ossdStatus", "E")),
-                        )
-                    )
-                    loaded += 1
-            if loaded:
-                self._v.append_log(f"WAL geladen: {loaded} OSSD-Events pending.")
-        except Exception as e:
-            self._v.append_log(format_current_exception(f"WAL laden fehlgeschlagen: {e}"))
-
-    def _rewrite_wal(self, entries: List[OSSDEntryDTO]) -> None:
-        try:
-            if not entries:
-                if self._wal.exists():
-                    self._wal.unlink(missing_ok=True)  # py>=3.8
+        vis = self._hover_ann.get_visible()
+        if event.inaxes == self._ax_w and self._ossd_x:
+            cont, ind = self._scatter.contains(event)
+            if cont and ind.get("ind"):
+                idx = ind["ind"][0]
+                x = self._ossd_x[idx]
+                y = self._ossd_y[idx]
+                self._hover_ann.xy = (x, y)
+                self._hover_ann.set_text(self._ossd_label[idx])
+                self._hover_ann.set_visible(True)
+                self._canvas.draw_idle()
                 return
 
-            tmp = self._wal.with_suffix(".tmp")
-            with tmp.open("w", encoding="utf-8") as f:
-                for entry in entries:
-                    rec = {
-                        "time": entry.time.isoformat(),
-                        "lichtgitterNr": entry.lichtgitterNr,
-                        "ossdNr": entry.ossdNr,
-                        "ossdStatus": entry.ossdStatus,
-                    }
-                    f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-            tmp.replace(self._wal)
-        except Exception:
-            pass
-
-    # ---------------- GUI invoke ----------------
-    @QtCore.Slot(object)
-    def _invoke_safe(self, fn_obj: object) -> None:
-        try:
-            if callable(fn_obj):
-                fn_obj()
-        except Exception:
-            # Logging darf niemals die UI töten
-            try:
-                self._v.append_log(format_current_exception("GUI invoke fehlgeschlagen"))
-            except Exception:
-                pass
-
-    def _post(self, fn: Callable[[], None]) -> None:
-        """
-        Thread-sicher in GUI posten.
-        """
-        try:
-            self._invoker.invoke.emit(fn)
-        except Exception:
-            # letzter Fallback
-            try:
-                QtCore.QTimer.singleShot(0, fn)
-            except Exception:
-                pass
+        if vis:
+            self._hover_ann.set_visible(False)
+            self._canvas.draw_idle()
