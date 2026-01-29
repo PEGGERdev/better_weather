@@ -32,7 +32,7 @@ class OSSD(BaseModel):
     time: Optional[datetime] = None
     lichtgitterNr: int
     ossdNr: int
-    ossdStatus: str = Field(min_length=1, max_length=4)
+    ossdStatus: str
 
     @field_validator("time")
     @classmethod

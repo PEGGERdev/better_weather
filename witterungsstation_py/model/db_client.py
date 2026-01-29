@@ -46,6 +46,22 @@ class DbClient:
                 self._log(format_current_exception(f"POST /weather returned HTTP {r.status_code}: {r.text}"))
         except Exception as e:
             self._log(format_current_exception(f"POST /weather failed: {e}"))
+        
+    def get_weather(self, limit: int = None) -> WeatherDTO:
+        """
+        GET /weather and return a tail slice if limit is given.
+
+        NOTE
+        - If the backend does not provide server-side limit/sort, we take a client-side tail.
+        """
+
+        r = self._s.get(f"{self.base}/weather/", timeout=5)
+        r.raise_for_status()
+        data = r.json()
+        def limited_data(data, limit):
+            if isinstance(data, list) and len(data) > limit:
+                return data[-limit:]
+        return data if (limit == None) else limited_data(data, limit)
 
     # ---------------- OSSD (strict) ----------------
     def post_ossd(self, entry: OSSDEntryDTO) -> None:
@@ -59,7 +75,7 @@ class DbClient:
         r = self._s.post(
             f"{self.base}/ossd/",
             json={
-                "time": entry.time.isoformat(),
+                "time": None,
                 "lichtgitterNr": entry.lichtgitterNr,
                 "ossdNr": entry.ossdNr,
                 "ossdStatus": entry.ossdStatus,
@@ -68,9 +84,9 @@ class DbClient:
         )
         r.raise_for_status()
 
-    def get_ossd_recent(self, limit: int = 200) -> List[dict]:
+    def get_ossd(self, limit: int = None) -> List[dict]:
         """
-        GET /ossd and return a tail slice.
+        GET /ossd and return a tail slice if limit is given.
 
         NOTE
         - If the backend does not provide server-side limit/sort, we take a client-side tail.
@@ -78,6 +94,7 @@ class DbClient:
         r = self._s.get(f"{self.base}/ossd/", timeout=5)
         r.raise_for_status()
         data = r.json()
-        if isinstance(data, list) and len(data) > limit:
-            data = data[-limit:]
-        return data
+        def limited_data(data, limit):
+            if isinstance(data, list) and len(data) > limit:
+                return data[-limit:]
+        return data if (limit == None) else limited_data(data, limit)

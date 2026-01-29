@@ -1,4 +1,3 @@
-# model/serial_ossd.py
 from __future__ import annotations
 
 """
@@ -36,7 +35,6 @@ class SerialOSSD(OSSDPort):
         self._log = log or (lambda *_: None)
 
         # NOTE: Arduino/serial often needs a brief moment after open().
-        time.sleep(0.2)
 
     # ---------------- parsing ----------------
     def _parse_line(self, line: str) -> Optional[Tuple[bool, bool, bool, bool]]:

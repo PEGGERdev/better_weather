@@ -92,7 +92,7 @@ def main() -> None:
     install_global_exception_hooks(log=gui.log, post=gui.post)
 
     # ---------------- ENV / defaults ----------------
-    serial_port = os.getenv("SERIAL_PORT", "COM6")
+    serial_port = os.getenv("SERIAL_PORT", "/dev/ttyACM0")
     serial_baud = _env_int("SERIAL_BAUD", 9600)
     hid_vid = _env_int("HID_VID", 0x1941)
     hid_pid = _env_int("HID_PID", 0x8021)
