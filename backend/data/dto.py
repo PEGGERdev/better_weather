@@ -3,6 +3,9 @@ from datetime import datetime
 from typing import Optional
 import re
 
+from routing.routing import mongo_entity
+
+@mongo_entity(collection="weather", tags=["Weather"])
 class Weather(BaseModel):
     """Weather reading."""
     temp: float
@@ -27,6 +30,8 @@ class Weather(BaseModel):
             raise ValueError("winddir must be 1-3 letters (e.g., N, NE, SSW)")
         return vv
 
+
+@mongo_entity(collection="ossd", tags=["OSSD"])
 class OSSD(BaseModel):
     """OSSD Event (without FK)."""
     time: Optional[datetime] = None

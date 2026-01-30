@@ -22,27 +22,21 @@ class MongoRepository:
         result = self.collection.insert_one(entity.model_dump())
         return str(result.inserted_id)
 
-    def read(self, entity_id: str) -> Optional[T]:
+    def read(self, entity_id: ObjectId) -> Optional[T]:
         """Find single entity by ID"""
-        if not ObjectId.is_valid(entity_id):
-            return None
         return self.collection.find_one({"_id": ObjectId(entity_id)})
 
     def read_all(self):
         """Retrieve all entities in collection"""
         return self.collection.find()
 
-    def update(self, entity_id: str, entity: T):
+    def update(self, entity_id: ObjectId, entity: T):
         """Update existing entity"""
-        if not ObjectId.is_valid(entity_id):
-            return None
         return self.collection.update_one(
             {"_id": ObjectId(entity_id)},
             {"$set": entity.model_dump()}
         )
 
-    def delete(self, entity_id: str):
+    def delete(self, entity_id: ObjectId):
         """Remove entity by ID"""
-        if not ObjectId.is_valid(entity_id):
-            return None
         return self.collection.delete_one({"_id": ObjectId(entity_id)})
