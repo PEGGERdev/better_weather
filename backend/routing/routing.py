@@ -68,15 +68,15 @@ def mongo_entity(
 
 class Routing():
     def __init__(self):
-        app = FastAPI()
-        app.add_middleware(
+        self.app = FastAPI()
+        self.app.add_middleware(
             CORSMiddleware,
             allow_origins=["*"],
             allow_methods=["*"],
             allow_headers=["*"],
         )
         for router in get_routers():
-            app.include_router(router)
+            self.app.include_router(router)
         
     def get_app(self):
         return self.app
