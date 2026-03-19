@@ -1,9 +1,6 @@
 <template>
-  <BaseCard>
-    <BaseSectionTitle
-      title="Webcam"
-      subtitle="Live-Bild mit periodischem Screenshot"
-    />
+  <BaseCard data-testid="widget-webcam">
+    <BaseSectionTitle title="Webcam" subtitle="Live-Bild mit periodischem Screenshot" />
     <WebcamStream />
   </BaseCard>
 </template>

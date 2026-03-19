@@ -18,11 +18,12 @@ Configuration (ENV)
 - WEATHER_TEMP_SCALE=0.1       -> default 0.1
 - WEATHER_PRESSURE_SCALE=0.1   -> default 0.1
 - WEATHER_WIND_SCALE=0.1       -> default 0.1
+- WEATHER_WIND_OFFSET=1.2      -> subtract calm baseline, clamp at 0
 - WEATHER_RAIN_FACTOR=0.3      -> default 0.3
 - WEATHER_LIGHT_DIV=10         -> default 10
 """
 
-from typing import Optional, Callable, Dict
+from typing import Optional, Callable, Dict, Any, cast
 from dataclasses import dataclass
 import os
 import time
@@ -41,7 +42,7 @@ _WINDDIR = {
 @dataclass
 class _Weather:
     temp: float
-    preassure: float
+    pressure: float
     light: float
     winds: float
     winddir: str
@@ -100,6 +101,7 @@ class HidWeatherSensor(WeatherSensorPort):
 
         # Rate-limited logging to avoid console spam.
         self._err_gate: Dict[str, float] = {}
+        self._open_hint_logged = False
 
         # Decoding knobs (device-specific; keep defaults matching your previous code).
         self._debug = _env_bool("WEATHER_DEBUG", False)
@@ -108,6 +110,7 @@ class HidWeatherSensor(WeatherSensorPort):
         self._temp_scale = _env_float("WEATHER_TEMP_SCALE", 0.1)
         self._pressure_scale = _env_float("WEATHER_PRESSURE_SCALE", 0.1)
         self._wind_scale = _env_float("WEATHER_WIND_SCALE", 0.1)
+        self._wind_offset = _env_float("WEATHER_WIND_OFFSET", 1.2)
 
         self._rain_factor = _env_float("WEATHER_RAIN_FACTOR", 0.3)
         self._light_div = _env_int("WEATHER_LIGHT_DIV", 10)
@@ -137,19 +140,32 @@ class HidWeatherSensor(WeatherSensorPort):
             return True
         except Exception:
             self._dev = None
+            try:
+                available = hid.enumerate(self.vid, self.pid)
+                if available and not self._open_hint_logged:
+                    self._log(
+                        f"HID device is present (VID=0x{self.vid:04X}, PID=0x{self.pid:04X}) "
+                        "but open failed. This is often a hidraw permission issue."
+                    )
+                    self._open_hint_logged = True
+            except Exception:
+                pass
             self._log_rl("open", f"HID open failed (VID=0x{self.vid:04X}, PID=0x{self.pid:04X})")
             return False
 
     def _write_hex(self, hex_bytes: str, out_len: int) -> bool:
         if not self._ensure_open():
             return False
+        if self._dev is None:
+            return False
+        dev = cast(Any, self._dev)
         parts = [p for p in hex_bytes.split() if p]
         payload = bytes(int(p, 16) & 0xFF for p in parts)
         if len(payload) < out_len:
             payload += b"\x00" * (out_len - len(payload))
         data = bytes([0]) + payload  # report-id prefix
         try:
-            return self._dev.write(data) > 0
+            return dev.write(data) > 0
         except Exception:
             self._log_rl("write", "HID write failed")
             return False
@@ -157,11 +173,14 @@ class HidWeatherSensor(WeatherSensorPort):
     def _read_bytes(self, want: int, timeout: float) -> bytes:
         if not self._ensure_open():
             return b""
+        if self._dev is None:
+            return b""
+        dev = cast(Any, self._dev)
         out = bytearray()
         end = time.time() + timeout
         while len(out) < want and time.time() < end:
             try:
-                raw = self._dev.read(65)
+                raw = dev.read(65)
                 if raw:
                     out.extend(raw[1:])  # drop report-id
                 else:
@@ -208,12 +227,12 @@ class HidWeatherSensor(WeatherSensorPort):
             press_raw = _u16le(raw[7], raw[8])
 
             temp = float(temp_raw) * self._temp_scale
-            preassure = float(press_raw) * self._pressure_scale
+            pressure = float(press_raw) * self._pressure_scale
 
             # wind: your previous formula looked wrong.
             # Common pattern: low byte in raw[9], high nibble in raw[10] (12-bit).
             wind_raw = ((raw[10] & 0x0F) << 8) | raw[9]
-            winds = float(wind_raw) * self._wind_scale
+            winds = max(0.0, float(wind_raw) * self._wind_scale - self._wind_offset)
 
             winddir = _WINDDIR.get(raw[12], "")
 
@@ -230,7 +249,7 @@ class HidWeatherSensor(WeatherSensorPort):
                 f"ptr=({b0:02X},{b1:02X}) ptr_used=({p_lo:02X},{p_hi:02X}) "
                 f"raw[0:19]={raw[:19].hex(' ')} "
                 f"temp_raw={temp_raw} temp={temp} "
-                f"press_raw={press_raw} press={preassure} "
+                f"press_raw={press_raw} press={pressure} "
                 f"wind_raw={wind_raw} wind={winds} "
                 f"dir={winddir} rain={rain} light_raw={light_raw} light={light} hum={humidity}"
             )
@@ -239,4 +258,4 @@ class HidWeatherSensor(WeatherSensorPort):
             self._log_rl("parse", "HID weather parse failed", cooldown_sec=30.0)
             return None
 
-        return _Weather(temp, preassure, light, winds, winddir, rain, humidity, self.clock.now())
+        return _Weather(temp, pressure, light, winds, winddir, rain, humidity, self.clock.now())

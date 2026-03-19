@@ -7,10 +7,16 @@
     "node": "^20.19.0 || >=22.12.0"
   },
   "scripts": {
+    "gen:contracts": "python3 ./scripts/generate_contracts.py",
+    "check:contracts": "node ./scripts/check-contracts.mjs",
+    "pretype-check": "npm run gen:contracts",
+    "prebuild": "npm run gen:contracts",
     "dev": "vite",
     "build": "run-p type-check \"build-only {@}\" --",
     "preview": "vite preview",
-    "test:unit": "vitest",
+    "test": "vitest",
+    "test:run": "vitest run",
+    "test:coverage": "vitest run --coverage",
     "build-only": "vite build",
     "type-check": "vue-tsc --build",
     "format": "prettier --write src/"
@@ -18,7 +24,6 @@
   "dependencies": {
     "chart.js": "^4.5.1",
     "chartjs-adapter-date-fns": "^3.0.0",
-    "pinia": "^3.0.4",
     "vue": "^3.5.22"
   },
   "devDependencies": {

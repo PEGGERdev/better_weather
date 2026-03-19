@@ -10,5 +10,5 @@ urllib3==2.5.0
 iso8601==2.1.0
 future==1.0.0
 PySide6==6.10.0
-serial
+pyserial
 hidapi

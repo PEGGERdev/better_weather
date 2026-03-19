@@ -14,12 +14,12 @@
         </tr>
       </thead>
       <tbody>
-        <tr v-for="entry in interrupts" :key="entry.auto_id">
-          <td>{{ entry.time }}</td>
+        <tr v-for="(entry, index) in interrupts" :key="entry._id ?? `${entry.time}-${index}`">
+          <td>{{ formatDateTime(entry.time) }}</td>
           <td>{{ entry.lichtgitterNr }}</td>
           <td>{{ entry.ossdNr }}</td>
           <td>{{ entry.ossdStatus }}</td>
-          <td>{{ entry.auto_id }}</td>
+          <td>{{ entry._id ?? '-' }}</td>
         </tr>
       </tbody>
     </table>
@@ -28,6 +28,7 @@
 
 <script setup lang="ts">
 import type { InterruptRecord } from '../../types/domain'
+import { formatDateTime } from '@/utils/formatDateTime'
 
 defineProps<{
   interrupts: InterruptRecord[]

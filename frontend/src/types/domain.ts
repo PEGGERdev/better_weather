@@ -1,32 +1,27 @@
+import type {
+  BackendInterruptRecord,
+  BackendOssdStatus,
+  BackendWeatherRecord,
+  BackendWitterungsstationPyStateRecord,
+} from '@/api/generated/backendContract'
+
 export type LichtgitterNr = 1 | 2
 export type OssdNr = 1 | 2
 
-export interface WeatherRecord {
-  _id?: string            // optionales MongoDB id-Feld
-  auto_id: number
-  temp: number
-  preassure: number
-  light: number
-  winds: number
-  winddir: number
-  humidity: number
-  rain: number
-  time: string
-}
+export type WeatherRecord = BackendWeatherRecord
 
-export type OssdStatus = 'INT' | 'OK'
+export type OssdStatus = BackendOssdStatus
 
-export interface InterruptRecord {
-  _id?: string            // optionales MongoDB id-Feld
-  auto_id: number
-  fk_weather: number
+export interface InterruptRecord extends Omit<BackendInterruptRecord, 'lichtgitterNr' | 'ossdNr' | 'ossdStatus'> {
   lichtgitterNr: LichtgitterNr
   ossdNr: OssdNr
   ossdStatus: OssdStatus
-  time: string
 }
+
+export type AppStateRecord = BackendWitterungsstationPyStateRecord
 
 export interface DashboardData {
   weather: WeatherRecord[]
   interrupts: InterruptRecord[]
+  appStates: AppStateRecord[]
 }

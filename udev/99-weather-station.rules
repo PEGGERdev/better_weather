@@ -1,0 +1,8 @@
+# Udev rules for weather station USB HID access
+# Allows non-root users to access the weather station
+
+# Weather Station (Dream Link WH1080) - VID:0x1941 PID:0x8021
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="1941", ATTRS{idProduct}=="8021", MODE="0666"
+
+# Alternative: assign to a specific group (replace 'dialout' with your preferred group)
+# SUBSYSTEM=="hidraw", ATTRS{idVendor}=="1941", ATTRS{idProduct}=="8021", GROUP="dialout", MODE="0660"

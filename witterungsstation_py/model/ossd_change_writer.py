@@ -15,7 +15,7 @@ from typing import List, Tuple, Optional, Callable
 from datetime import datetime
 
 from model.dto import OSSDEntryDTO, OSSDWriteResult
-from model.db_client import DbClient
+from model.ports import TelemetryPort
 
 from exception_handler import format_current_exception
 
@@ -26,7 +26,7 @@ class OSSDChangeWriter:
     last_sent: List[Optional[bool]] for 4 channels.
     """
 
-    def __init__(self, db: DbClient, logger: Callable[[str], None] | None = None) -> None:
+    def __init__(self, db: TelemetryPort, logger: Callable[[str], None] | None = None) -> None:
         self._db = db
         self._log = logger or (lambda *_: None)
         self.last_sent: List[Optional[bool]] = [None, None, None, None]

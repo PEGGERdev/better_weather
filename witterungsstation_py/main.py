@@ -4,39 +4,34 @@ from __future__ import annotations
 Witterungstester – Main (Composition Root)
 
 Role
-- Wires concrete implementations (Clock, SerialOSSD, HidWeatherSensor, DbClient, Controller, View).
+- Wires the legacy registry-driven GUI runtime (controller/services/view).
 - Connects Qt signals and installs global exception hooks.
+
+Status
+- Legacy compatibility runtime. First-class product runtime is backend + web frontend.
 
 Design
 - Keep composition here (DIP), keep business logic inside controller/model.
 """
 
-import os
 from PySide6 import QtWidgets, QtCore
 
+from bootstrap.app_bootstrap import build_gui_context
 from view.qt_app import MainWindow, apply_dark_palette
-from controller.app_controller import AppController
-
-from model.system_clock import SystemClock
-from model.serial_ossd import SerialOSSD
-from model.hid_sensor import HidWeatherSensor
-from model.db_client import DbClient
 
 from exception_handler import install_global_exception_hooks, format_current_exception
 
 
-def _env_int(name: str, default: int) -> int:
-    """
-    Helper: read an int from ENV.
-    Supports decimal and 0x.. (hex).
-    """
-    v = os.getenv(name)
-    try:
-        if v and v.lower().startswith("0x"):
-            return int(v, 16)
-        return int(v) if v is not None else default
-    except Exception:
-        return default
+class _GuiInvoker(QtCore.QObject):
+    invoke = QtCore.Signal(object)
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.invoke.connect(self._run, QtCore.Qt.ConnectionType.QueuedConnection)
+
+    @QtCore.Slot(object)
+    def _run(self, fn) -> None:
+        fn()
 
 
 class GuiDispatch:
@@ -52,10 +47,14 @@ class GuiDispatch:
     def __init__(self, app: QtWidgets.QApplication, win: MainWindow) -> None:
         self._app = app
         self._win = win
+        self._invoker = _GuiInvoker()
 
     def post(self, fn) -> None:
         try:
-            QtCore.QTimer.singleShot(0, fn)
+            if QtCore.QThread.currentThread() == self._app.thread():
+                fn()
+            else:
+                self._invoker.invoke.emit(fn)
         except Exception:
             # Last-resort fallback: execute directly (Qt may be shutting down)
             try:
@@ -91,42 +90,9 @@ def main() -> None:
     # Global: unhandled exceptions -> GUI console + full traceback
     install_global_exception_hooks(log=gui.log, post=gui.post)
 
-    # ---------------- ENV / defaults ----------------
-    serial_port = os.getenv("SERIAL_PORT", "/dev/ttyACM0")
-    serial_baud = _env_int("SERIAL_BAUD", 9600)
-    hid_vid = _env_int("HID_VID", 0x1941)
-    hid_pid = _env_int("HID_PID", 0x8021)
-    interval = float(os.getenv("INTERVAL_SEC", "30"))
-    poll_sec = float(os.getenv("POLL_SEC", "0.2"))
-    base_url = os.getenv("BACKEND_BASE", "http://127.0.0.1:8000")
-
-    # ---------------- model wiring ----------------
-    clock = SystemClock()
-    db = DbClient(base_url, log=gui.log)
-
-    # NOTE: Hardware adapters are optional; app should still start without them.
-    try:
-        ossd = SerialOSSD(serial_port, serial_baud, clock, log=gui.log)
-    except Exception as e:
-        ossd = None
-        gui.log(format_current_exception(f"OSSD init failed: {e}"))
-
-    try:
-        weather = HidWeatherSensor(hid_vid, hid_pid, clock, log=gui.log)
-    except Exception as e:
-        weather = None
-        gui.log(format_current_exception(f"Weather sensor init failed: {e}"))
-
-    # ---------------- controller ----------------
-    ctrl = AppController(
-        view=win,
-        model_db=db,
-        weather=weather,
-        ossd=ossd,
-        clock=clock,
-        interval_sec=interval,
-        poll_sec=poll_sec,
-    )
+    # ---------------- runtime context ----------------
+    ctx = build_gui_context(view=win, log=gui.log, post=gui.post)
+    ctrl = ctx.controller("app")
 
     # ---------------- view events ----------------
     win.startClicked.connect(ctrl.start)

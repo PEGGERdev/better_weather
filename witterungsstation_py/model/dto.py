@@ -16,13 +16,21 @@ Conventions
 
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Optional
+from pathlib import Path
+import sys
+from typing import Literal, Optional
+
+try:
+    from shared.mongo_entity import mongo_entity
+except ModuleNotFoundError:
+    sys.path.append(str(Path(__file__).resolve().parents[2]))
+    from shared.mongo_entity import mongo_entity
 
 
 @dataclass
 class WeatherDTO:
     temp: Optional[float]
-    preassure: Optional[float]
+    pressure: Optional[float]
     light: Optional[float]
     winds: Optional[float]
     winddir: Optional[str]
@@ -43,3 +51,10 @@ class OSSDEntryDTO:
 class OSSDWriteResult:
     posted: int
     skipped: int
+
+
+@mongo_entity(collection="witterungsstation_py_state", tags=["WitterungsstationPyState"])
+@dataclass
+class WitterungsstationPyStateDTO:
+    time: datetime
+    state: Literal["start", "stop"]

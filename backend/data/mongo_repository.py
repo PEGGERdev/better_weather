@@ -1,5 +1,5 @@
 from bson import ObjectId
-from pymongo import MongoClient, IndexModel
+from pymongo import DESCENDING, MongoClient
 from pydantic import BaseModel
 from typing import TypeVar, Type, Optional
 import os
@@ -26,9 +26,12 @@ class MongoRepository:
         """Find single entity by ID"""
         return self.collection.find_one({"_id": ObjectId(entity_id)})
 
-    def read_all(self):
+    def read_all(self, limit: int | None = None):
         """Retrieve all entities in collection"""
-        return self.collection.find()
+        cursor = self.collection.find().sort("time", DESCENDING)
+        if limit is not None and int(limit) > 0:
+            cursor = cursor.limit(int(limit))
+        return list(cursor)
 
     def update(self, entity_id: ObjectId, entity: T):
         """Update existing entity"""

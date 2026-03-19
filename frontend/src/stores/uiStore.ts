@@ -1,50 +1,21 @@
-// src/stores/uiStore.ts
-import { defineStore } from 'pinia'
-import { ref, reactive } from 'vue'
+export type ChartColorKey = 'temp' | 'winds' | 'humidity' | 'light' | 'pressure' | 'interrupts' | 'offline'
 
 export type ChartConfig = {
   visibleDatasets: {
     temp: boolean
+    winds: boolean
     light: boolean
+    pressure: boolean
     humidity: boolean
+    winddir: boolean
+    interrupts: boolean
   }
+  timeWindow: '6h' | '24h' | '7d' | 'all'
   timeUnit: 'minute' | 'hour' | 'day'
+  windowSpanPercent: number
+  windowSpanMode: 'preset' | 'manual'
   tension: number
   autoY: boolean
   yMax?: number | null
+  colors: Record<ChartColorKey, string>
 }
-
-export const useUiStore = defineStore('ui', () => {
-  const expandedChart = ref<boolean>(false)
-  const expandedChartId = ref<string | null>(null) // e.g. 'weather'
-  const chartConfig = reactive<ChartConfig>({
-    visibleDatasets: { temp: true, light: true, humidity: true },
-    timeUnit: 'minute',
-    tension: 0.25,
-    autoY: true,
-    yMax: null
-  })
-
-  function expandChart(id: string) {
-    expandedChart.value = true
-    expandedChartId.value = id
-    // scroll to top maybe handled by page when expanded
-  }
-  function collapseChart() {
-    expandedChart.value = false
-    expandedChartId.value = null
-  }
-
-  function setChartConfig(patch: Partial<ChartConfig>) {
-    Object.assign(chartConfig, patch)
-  }
-
-  return {
-    expandedChart,
-    expandedChartId,
-    chartConfig,
-    expandChart,
-    collapseChart,
-    setChartConfig
-  }
-})
