@@ -1,4 +1,10 @@
 **/.venv/
 **/node_modules/
-**/__pycache__
+**/__pycache__/
+*.py[cod]
 .env
+ossd_events_wal.jsonl
+frontend/description-temporary.txt
+scripts/guest_wlan_reconnect.sh
+scripts/guest_wlan_reconnect.service
+scripts/install_guest_wlan_reconnect.sh
